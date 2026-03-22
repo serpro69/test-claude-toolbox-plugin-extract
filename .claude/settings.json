@@ -59,18 +59,17 @@
     "CLAUDE_STATUSLINE_THEME": "catppuccin",
     "CLAUDE_STATUSLINE_MODE": "dark"
   },
-  "hooks": {
-    "PreToolUse": [
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash $CLAUDE_PROJECT_DIR/.claude/scripts/validate-bash.sh"
-          }
-        ]
+  "extraKnownMarketplaces": {
+    "claude-toolbox": {
+      "source": {
+        "source": "git-subdir",
+        "url": "https://github.com/serpro69/claude-toolbox.git",
+        "path": "klaude-plugin"
       }
-    ]
+    }
+  },
+  "enabledPlugins": {
+    "kk@claude-toolbox": true
   },
   "statusLine": {
     "type": "command",
