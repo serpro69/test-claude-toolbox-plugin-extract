@@ -34,6 +34,7 @@ jobs:
       old_version: ${{ steps.manifest.outputs.old_version }}
       new_version: ${{ steps.sync.outputs.resolved_version }}
       diff_summary: ${{ steps.sync.outputs.diff_summary }}
+      plugin_migrated: ${{ steps.sync.outputs.plugin_migrated }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v6
@@ -77,6 +78,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
+
+      - name: Fetch target sync script from upstream
+        run: |
+          # Resolve upstream repo and target version
+          UPSTREAM_REPO=$(jq -r '.upstream_repo // "serpro69/claude-toolbox"' .github/template-state.json)
+          VERSION="${{ inputs.version }}"
+
+          # Resolve "latest" to the most recent tag
+          if [[ "$VERSION" == "latest" ]]; then
+            VERSION=$(git ls-remote --tags --sort=-v:refname "https://github.com/$UPSTREAM_REPO.git" \
+              | grep -v '\^{}' | head -1 | sed 's/.*refs\/tags\///')
+            if [[ -z "$VERSION" ]]; then
+              VERSION="HEAD"
+            fi
+          fi
+
+          echo "Fetching template-sync.sh from $UPSTREAM_REPO @ $VERSION"
+          SCRIPT_URL="https://raw.githubusercontent.com/$UPSTREAM_REPO/$VERSION/.github/scripts/template-sync.sh"
+          if curl -fsSL "$SCRIPT_URL" -o .github/scripts/template-sync.sh.new 2>/dev/null; then
+            mv .github/scripts/template-sync.sh.new .github/scripts/template-sync.sh
+            chmod +x .github/scripts/template-sync.sh
+            echo "Updated template-sync.sh to $VERSION"
+          else
+            echo "::warning::Could not fetch upstream template-sync.sh, using local version"
+          fi
 
       - name: Run Template Sync
         id: sync
@@ -137,6 +163,23 @@ jobs:
         with:
           name: sync-diff-report
           path: .github/sync-artifacts
+
+      - name: Run Plugin Migration
+        if: needs.sync.outputs.plugin_migrated == 'true'
+        run: |
+          echo "Migrating to kk plugin system..."
+          # Remove template-managed skills, commands, hooks, and validator
+          rm -rf .claude/skills .claude/commands
+          rm -f .claude/scripts/validate-bash.sh
+          # Remove hooks from settings.json (substituted template will provide marketplace config)
+          if [[ -f .claude/settings.json ]] && jq -e '.hooks' .claude/settings.json &>/dev/null; then
+            jq 'del(.hooks)' .claude/settings.json > .claude/settings.json.tmp
+            mv .claude/settings.json.tmp .claude/settings.json
+          fi
+          # Set plugin_migrated flag in manifest
+          jq '.plugin_migrated = true' .github/template-state.json > .github/template-state.json.tmp
+          mv .github/template-state.json.tmp .github/template-state.json
+          echo "Plugin migration complete"
 
       - name: Apply Staged Changes
         run: |
