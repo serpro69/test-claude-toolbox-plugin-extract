@@ -79,6 +79,9 @@ SYNC_EXCLUSIONS=()
 # Resolved version (for reporting)
 RESOLVED_VERSION=""
 
+# Plugin migration tracking
+PLUGIN_MIGRATED=false
+
 # =============================================================================
 # Color Output
 # =============================================================================
@@ -388,6 +391,131 @@ migrate_manifest() {
 }
 
 # =============================================================================
+# Plugin Migration Functions
+# =============================================================================
+
+# needs_plugin_migration()
+# Checks whether the downstream repo needs to migrate from template-managed
+# skills/commands/hooks to the kk plugin system.
+#
+# Args:
+#   $1 - Path to fetched upstream directory (parent of klaude-plugin/)
+#
+# Returns:
+#   0 if migration is needed
+#   1 if migration is not needed (already migrated or upstream has no plugin)
+needs_plugin_migration() {
+  local upstream_dir="$1"
+
+  # Check if upstream has the plugin
+  if [[ ! -f "$upstream_dir/klaude-plugin/.claude-plugin/plugin.json" ]]; then
+    return 1
+  fi
+
+  # Check if already migrated
+  if [[ -f "$MANIFEST_PATH" ]] && jq -e '.plugin_migrated == true' "$MANIFEST_PATH" &>/dev/null; then
+    return 1
+  fi
+
+  return 0
+}
+
+# run_plugin_migration()
+# Removes template-managed skills, commands, hooks, and validate-bash.sh
+# from the downstream repo and updates settings.json for the plugin system.
+#
+# Side effects:
+#   - Deletes known template-managed files from .claude/
+#   - Updates .claude/settings.json: removes hooks, adds marketplace/plugin config
+#   - Sets plugin_migrated=true in template-state.json
+#   - Appends removed files to DELETED_FILES array
+#   - Logs all actions
+run_plugin_migration() {
+  log_step "Migrating to kk plugin system"
+
+  local upstream_repo
+  upstream_repo=$(get_manifest_value '.upstream_repo')
+
+  # Static list of known template-managed files to remove
+  local dirs_to_remove=(
+    ".claude/skills/analysis-process"
+    ".claude/skills/cove"
+    ".claude/skills/development-guidelines"
+    ".claude/skills/documentation-process"
+    ".claude/skills/implementation-process"
+    ".claude/skills/implementation-review"
+    ".claude/skills/merge-docs"
+    ".claude/skills/solid-code-review"
+    ".claude/skills/testing-process"
+    ".claude/commands/cove"
+    ".claude/commands/implementation-review"
+    ".claude/commands/migrate-from-taskmaster"
+    ".claude/commands/sync-workflow"
+  )
+  local files_to_remove=(
+    ".claude/scripts/validate-bash.sh"
+  )
+
+  # Remove directories
+  for dir in "${dirs_to_remove[@]}"; do
+    if [[ -d "$dir" ]]; then
+      rm -rf "$dir"
+      DELETED_FILES+=("$dir/")
+      log_info "Removed $dir/"
+    fi
+  done
+
+  # Remove individual files
+  for file in "${files_to_remove[@]}"; do
+    if [[ -f "$file" ]]; then
+      rm -f "$file"
+      DELETED_FILES+=("$file")
+      log_info "Removed $file"
+    fi
+  done
+
+  # Clean up empty parent directories
+  rmdir .claude/skills 2>/dev/null || true
+  rmdir .claude/commands 2>/dev/null || true
+
+  # Update settings.json: remove hooks, add marketplace and plugin config
+  local settings_file=".claude/settings.json"
+  if [[ -f "$settings_file" ]]; then
+    local tmp
+    tmp=$(mktemp "/tmp/settings-migrate.XXXXXX")
+    if jq --arg repo "$upstream_repo" \
+      'del(.hooks) |
+       .extraKnownMarketplaces = {
+         "claude-toolbox": {
+           "source": {
+             "source": "github",
+             "repo": $repo
+           }
+         }
+       }' "$settings_file" > "$tmp"; then
+      mv "$tmp" "$settings_file"
+      log_info "Updated $settings_file for plugin system"
+    else
+      rm -f "$tmp"
+      log_warn "Failed to update $settings_file — manual update required"
+    fi
+  fi
+
+  # Set plugin_migrated flag in manifest
+  local tmp
+  tmp=$(mktemp "/tmp/manifest-plugin.XXXXXX")
+  if jq '.plugin_migrated = true' "$MANIFEST_PATH" > "$tmp"; then
+    mv "$tmp" "$MANIFEST_PATH"
+    log_info "Set plugin_migrated flag in manifest"
+  else
+    rm -f "$tmp"
+    log_warn "Failed to update manifest — manual update required"
+  fi
+
+  log_success "Plugin migration complete"
+}
+
+# =============================================================================
 # Version Resolution and Template Fetching
 # =============================================================================
 
@@ -552,7 +680,7 @@ fetch_upstream_templates() {
   if ! git sparse-checkout init --cone --quiet 2>/dev/null; then
     log_warn "Sparse-checkout init failed, continuing with full checkout"
   fi
-  if ! git sparse-checkout set .github/templates .github/workflows/template-sync.yml .github/scripts/template-sync.sh docs/update.sh --quiet 2>/dev/null; then
+  if ! git sparse-checkout set .github/templates .github/workflows/template-sync.yml .github/scripts/template-sync.sh docs/update.sh klaude-plugin/.claude-plugin/plugin.json --quiet 2>/dev/null; then
     log_warn "Sparse-checkout set failed, templates may not exist at this version"
   fi
 
@@ -634,6 +762,18 @@ apply_substitutions() {
     # Statusline - template defaults to enhanced (statusline2.sh); switch to basic if requested
     if [[ "$cc_statusline" == "basic" ]]; then
       sed -i "s/statusline_enhanced\.sh/statusline.sh/g" "$cc_settings_file"
+    fi
+
+    # Plugin marketplace — replace directory source with GitHub source
+    # (upstream template uses directory source; downstream repos use github)
+    local upstream_repo
+    upstream_repo=$(get_manifest_value '.upstream_repo')
+    if jq -e '.extraKnownMarketplaces' "$cc_settings_file" &>/dev/null; then
+      jq --arg repo "$upstream_repo" \
+        '.extraKnownMarketplaces."claude-toolbox".source = {
+          "source": "github",
+          "repo": $repo
+        } | del(.enabledPlugins."kk@claude-toolbox") | if .enabledPlugins == {} then del(.enabledPlugins) else . end' "$cc_settings_file" > "${cc_settings_file}.tmp" && mv "${cc_settings_file}.tmp" "$cc_settings_file"
     fi
 
     log_info "Applied Claude Code settings"
@@ -862,6 +1002,7 @@ generate_diff_report() {
         echo "excluded_count=${#EXCLUDED_FILES[@]}"
         echo "total_changes=$total_changes"
         echo "resolved_version=$RESOLVED_VERSION"
+        echo "plugin_migrated=$PLUGIN_MIGRATED"
         echo "diff_summary<<EOF"
         generate_markdown_summary "$staging_dir"
         echo "EOF"
@@ -1035,6 +1176,18 @@ generate_markdown_summary() {
     done
     echo ""
   fi
+
+  if $PLUGIN_MIGRATED; then
+    echo "### Plugin Migration"
+    echo ""
+    echo "Skills, commands, and hooks have been migrated to the **kk** plugin."
+    echo "Template-managed files listed under \"Deleted Files\" above were removed."
+    echo ""
+    echo "**After merging this PR:**"
+    echo "1. Run \`/plugin install kk@claude-toolbox\` to install the plugin"
+    echo "2. Commands are now namespaced: \`/project:command\` → \`/kk:dir:command\` (skills remain unprefixed)"
+    echo ""
+  fi
 }
 
 # =============================================================================
@@ -1203,6 +1356,12 @@ main() {
     echo ""
   fi
 
+  # Run plugin migration if needed (before comparing files)
+  if needs_plugin_migration "$STAGING_DIR/upstream"; then
+    PLUGIN_MIGRATED=true
+    run_plugin_migration
+  fi
+
   # Apply substitutions to fetched templates
   SUBSTITUTED_TEMPLATES_PATH="$STAGING_DIR/substituted"
   apply_substitutions "$FETCHED_TEMPLATES_PATH" "$SUBSTITUTED_TEMPLATES_PATH"
@@ -1218,7 +1377,16 @@ main() {
   fi
 
   # Compare files and generate report
+  # Save migration deletions before compare_files resets arrays
+  local migration_deletions=()
+  if $PLUGIN_MIGRATED; then
+    migration_deletions=("${DELETED_FILES[@]}")
+  fi
   compare_files "$SUBSTITUTED_TEMPLATES_PATH"
+  # Merge migration deletions back
+  if [[ ${#migration_deletions[@]} -gt 0 ]]; then
+    DELETED_FILES+=("${migration_deletions[@]}")
+  fi
   generate_diff_report "$SUBSTITUTED_TEMPLATES_PATH"
 
   # Summary
