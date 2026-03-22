@@ -1,13 +1,14 @@
 {
   "schema_version": "1",
   "upstream_repo": "serpro69/claude-toolbox",
-  "template_version": "v0.4.0",
-  "synced_at": "2026-03-22T09:26:56Z",
+  "template_version": "plugin_extract",
+  "synced_at": "2026-03-22T10:13:16Z",
   "variables": {
     "PROJECT_NAME": "test-claude-toolbox-plugin-extract",
     "LANGUAGES": "markdown",
     "CC_MODEL": "default",
     "CC_STATUSLINE": "enhanced",
     "SERENA_INITIAL_PROMPT": ""
-  }
+  },
+  "plugin_migrated": true
 }
